@@ -22,6 +22,62 @@ async def preferences(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_failed_remove_restores_overlay_and_persisted_value(
+    preferences, monkeypatch
+):
+    store, database = preferences
+    await database.insert_preference_or_update(
+        "plugin", "example", "state", {"val": "old"}
+    )
+
+    async def fail_remove(*args):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(database, "remove_preference", fail_remove)
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await store.remove_async("plugin", "example", "state")
+
+    assert await store.get_async("plugin", "example", "state") == "old"
+
+
+@pytest.mark.asyncio
+async def test_failed_clear_restores_overlay_and_persisted_values(
+    preferences, monkeypatch
+):
+    store, database = preferences
+    await database.insert_preference_or_update("plugin", "example", "first", {"val": 1})
+    await database.insert_preference_or_update(
+        "plugin", "example", "second", {"val": 2}
+    )
+
+    async def fail_clear(*args):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(database, "clear_preferences", fail_clear)
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await store.clear_async("plugin", "example")
+
+    assert await store.get_async("plugin", "example", "first") == 1
+    assert await store.get_async("plugin", "example", "second") == 2
+
+
+@pytest.mark.asyncio
+async def test_pending_deletion_hides_persisted_value(preferences):
+    store, database = preferences
+    await database.insert_preference_or_update(
+        "plugin", "example", "state", {"val": "old"}
+    )
+
+    store.remove("state", scope="plugin", scope_id="example")
+
+    assert await store.get_async("plugin", "example", "state", "missing") == "missing"
+    await store.flush()
+    assert await database.get_preference("plugin", "example", "state") is None
+
+
+@pytest.mark.asyncio
 async def test_sync_put_updates_cache_and_persists_without_blocking(preferences):
     store, database = preferences
 

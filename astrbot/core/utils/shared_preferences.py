@@ -16,7 +16,10 @@ from .astrbot_path import get_astrbot_data_path
 
 _VT = TypeVar("_VT")
 _MISSING = object()
+_DELETED = object()
 logger = logging.getLogger("astrbot")
+_CacheKey = tuple[str, str, str]
+_CacheSnapshot = tuple[dict[_CacheKey, Any], bool]
 _WriteOperation = tuple[
     str,
     str,
@@ -24,6 +27,7 @@ _WriteOperation = tuple[
     str | None,
     Any,
     asyncio.Future[None] | None,
+    _CacheSnapshot | None,
 ]
 
 
@@ -52,6 +56,8 @@ class SharedPreferences:
         # See https://github.com/AstrBotDevs/AstrBot/pull/9649 for the original
         # deadlock scenario and design rationale.
         self._cache: dict[tuple[str, str, str], Any] = {}
+        # Deletions must mask database values until queued writes are persisted.
+        self._cleared_scopes: set[tuple[str, str]] = set()
         self._cache_lock = threading.RLock()
         self._cache_initialized = False
         self._initializing = False
@@ -78,13 +84,14 @@ class SharedPreferences:
         Args:
             operation: Queued write operation to reflect in memory.
         """
-        action, scope, scope_id, key, value, _ = operation
+        action, scope, scope_id, key, value, _, _ = operation
         with self._cache_lock:
             if action == "put" and key is not None:
                 self._cache[(scope, scope_id, key)] = deepcopy(value)
             elif action == "remove" and key is not None:
-                self._cache.pop((scope, scope_id, key), None)
+                self._cache[(scope, scope_id, key)] = _DELETED
             elif action == "clear":
+                self._cleared_scopes.add((scope, scope_id))
                 keys = [
                     cache_key
                     for cache_key in self._cache
@@ -92,6 +99,55 @@ class SharedPreferences:
                 ]
                 for cache_key in keys:
                     self._cache.pop(cache_key, None)
+
+    def _capture_cache_snapshot(
+        self,
+        operation: _WriteOperation,
+    ) -> _CacheSnapshot:
+        """Capture overlay state needed to roll back a failed write."""
+        _, scope, scope_id, key, _, _, _ = operation
+        with self._cache_lock:
+            if key is not None:
+                cache_key = (scope, scope_id, key)
+                return (
+                    {cache_key: self._cache.get(cache_key, _MISSING)},
+                    (scope, scope_id) in self._cleared_scopes,
+                )
+            return (
+                {
+                    cache_key: value
+                    for cache_key, value in self._cache.items()
+                    if cache_key[:2] == (scope, scope_id)
+                },
+                (scope, scope_id) in self._cleared_scopes,
+            )
+
+    def _restore_cache_snapshot(
+        self,
+        operation: _WriteOperation,
+    ) -> None:
+        snapshot = operation[6]
+        if snapshot is None:
+            return
+        _, scope, scope_id, key, _, _, _ = operation
+        previous_cache, was_cleared = snapshot
+        with self._cache_lock:
+            if key is not None:
+                cache_key = (scope, scope_id, key)
+                previous_value = previous_cache[cache_key]
+                if previous_value is _MISSING:
+                    self._cache.pop(cache_key, None)
+                else:
+                    self._cache[cache_key] = previous_value
+            else:
+                for cache_key in list(self._cache):
+                    if cache_key[:2] == (scope, scope_id):
+                        self._cache.pop(cache_key, None)
+                self._cache.update(previous_cache)
+            if was_cleared:
+                self._cleared_scopes.add((scope, scope_id))
+            else:
+                self._cleared_scopes.discard((scope, scope_id))
 
     def _schedule_write(self, operation: _WriteOperation) -> None:
         """Schedule a preference write on the owning event loop.
@@ -133,6 +189,7 @@ class SharedPreferences:
         Args:
             operation: Preference mutation to apply and persist.
         """
+        operation = (*operation[:6], self._capture_cache_snapshot(operation))
         with self._cache_lock:
             self._apply_cache_operation(operation)
             self._schedule_write(operation)
@@ -148,7 +205,7 @@ class SharedPreferences:
             except asyncio.QueueEmpty:
                 return
 
-            action, scope, scope_id, key, value, completion = operation
+            action, scope, scope_id, key, value, completion, _ = operation
             try:
                 if action == "put" and key is not None:
                     await self.db_helper.insert_preference_or_update(
@@ -164,6 +221,7 @@ class SharedPreferences:
                 else:
                     raise ValueError(f"Unknown preference write operation: {action}")
             except Exception as exc:
+                self._restore_cache_snapshot(operation)
                 logger.error(
                     "Failed to persist shared preference operation %s for %s/%s: %s",
                     action,
@@ -208,7 +266,7 @@ class SharedPreferences:
                             while True:
                                 try:
                                     operation = old_queue.get_nowait()
-                                    self._pending_writes.append((*operation[:-1], None))
+                                    self._pending_writes.append(operation)
                                     old_queue.task_done()
                                 except asyncio.QueueEmpty:
                                     break
@@ -288,8 +346,12 @@ class SharedPreferences:
             return default
         with self._cache_lock:
             value = self._cache.get((scope, scope_id, key), _MISSING)
+            if value is _DELETED:
+                return default
             if value is not _MISSING:
                 return deepcopy(value)
+            if (scope, scope_id) in self._cleared_scopes:
+                return default
         preference = await self.db_helper.get_preference(scope, scope_id, key)
         if preference is None:
             return default
@@ -391,6 +453,7 @@ class SharedPreferences:
             key,
             deepcopy(value),
             completion,
+            None,
         )
         self._submit_write(operation)
         await completion
@@ -412,6 +475,7 @@ class SharedPreferences:
             key,
             None,
             completion,
+            None,
         )
         self._submit_write(operation)
         await completion
@@ -434,6 +498,7 @@ class SharedPreferences:
             None,
             None,
             completion,
+            None,
         )
         self._submit_write(operation)
         await completion
@@ -483,8 +548,12 @@ class SharedPreferences:
         resolved_scope_id = scope_id or "unknown"
         with self._cache_lock:
             value = self._cache.get((resolved_scope, resolved_scope_id, key), _MISSING)
+            if value is _DELETED:
+                return default
             if value is not _MISSING:
                 return default if value is None else deepcopy(value)
+            if (resolved_scope, resolved_scope_id) in self._cleared_scopes:
+                return default
         # Overlay miss: fall back to a point query through a dedicated
         # synchronous database connection. This briefly blocks the calling
         # thread (unavoidable for a synchronous API), but never touches the
@@ -560,17 +629,21 @@ class SharedPreferences:
                 )
                 persisted = []
 
-        values = {
-            (preference.scope, preference.scope_id, preference.key): preference
-            for preference in persisted
-        }
         with self._cache_lock:
+            values = {
+                (preference.scope, preference.scope_id, preference.key): preference
+                for preference in persisted
+                if (preference.scope, preference.scope_id) not in self._cleared_scopes
+            }
             for (cache_scope, cache_scope_id, cache_key), value in self._cache.items():
                 if (
                     cache_scope == scope
                     and (scope_id is None or cache_scope_id == scope_id)
                     and (key is None or cache_key == key)
                 ):
+                    if value is _DELETED:
+                        values.pop((cache_scope, cache_scope_id, cache_key), None)
+                        continue
                     values[(cache_scope, cache_scope_id, cache_key)] = Preference(
                         scope=cache_scope,
                         scope_id=cache_scope_id,
@@ -594,6 +667,7 @@ class SharedPreferences:
             key,
             deepcopy(value),
             None,
+            None,
         )
         self._submit_write(operation)
 
@@ -612,6 +686,7 @@ class SharedPreferences:
             key,
             None,
             None,
+            None,
         )
         self._submit_write(operation)
 
@@ -622,6 +697,7 @@ class SharedPreferences:
             "clear",
             scope or "unknown",
             scope_id or "unknown",
+            None,
             None,
             None,
             None,
